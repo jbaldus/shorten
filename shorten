@@ -1,0 +1,161 @@
+#!/bin/bash
+ENDPOINT="https://is.gd/create.php"
+
+commandname=$(basename "$0")
+
+display_help() {
+ cat <<-EOF
+shorten - is.gd URL shortener with caching support
+
+Usage: $commandname [OPTION] [URL]
+       $commandname -s [URL]
+       $commandname -c [URL]
+
+Options:
+  -c          Or, if called as "shorten-clip", replace the clipboard contents with the shortened URL.
+  -s          Or, if called as "shorten-sel", put the shortened URL in the selection clipboard for middle-click paste.
+  --help      Display this help documentation.
+
+Arguments:
+  URL         The URL to be shortened. If not provided, the script attempts to read from the clipboard or stdin.
+
+Behavior:
+  The "shorten" script contacts is.gd to shorten the provided URL. The shortened URL is cached to avoid rate limiting.
+  If the script is called as "shorten-clip" or "shorten-sel" it interacts with the clipboard.
+
+Caching:
+  The script uses a cache file (~/.cache/shortendb) to store pairs of base64-encoded(original URL) and base64-encoded(shortened URL).
+  They are base64 encoded to simplify dealing with values or keys that contain spaces.
+
+Examples:
+  $commandname https://www.example.com            # Shortens the provided URL
+  $commandname -s https://www.example.com         # Shortens the URL and puts it in the selection clipboard
+  $commandname -c https://www.example.com         # Shortens the URL and replaces the clipboard contents
+EOF
+}
+
+# Set up a cache database. GD api says to cache shortened requests to avoid
+# being rate limited. This is a simple file that contains lines of the form:
+# base64encoded(url) base64encoded(shortened_url)
+# I base64 encode the key and values just to make sure there are no spaces in them.
+cache_setup () {
+  cache_file=${XDG_CACHE_HOME:-~/.cache}/shortendb
+  if [[ ! -f "$cache_file" ]]; then
+    mkdir -p $(dirname "$cache_file")
+    touch $cache_file
+  fi
+  echo $cache_file
+}
+
+cache_put () {
+  cache_file=$(cache_setup)
+  key=$(echo "$1" | base64 -w 0)
+  value=$(echo "$2" | base64 -w 0)
+  line=$(grep "^$1\ " "$cache_file")
+  if [[ "$line" == "" ]]; then
+    echo "$key $value" >> $cache_file
+  else
+    sed -ir "s_$key .*_$key $value_" $cache_file
+  fi
+}
+
+cache_get() {
+  shortened_regex='^https:\/\/is.gd\/.*$'
+  if [[ "$1" =~ $shortened_regex ]]; then
+    notify-send --urgency=low "$1 is already shortened"
+    echo $1 # Don't shorten already shortened urls
+  else
+    cache_file=$(cache_setup)
+    key=$(echo "$1" | base64 -w 0)
+    # echo $key >&2
+    sed -nr "s_^$key\ (.*$)_\1_p" $cache_file | base64 -d
+  fi
+}
+
+
+# If this is called as "shorten-clip", then replace the contents of
+# the clipboard with the shortened url. If it is called as "shorten-sel", 
+# just put it in the selection clipboard so it can be pasted with 
+# middle-click. Otherwise, print it to stdout
+case "$1" in
+  "-c")
+    commandname="shorten-clip"
+    shift
+    ;;
+  "-s")
+    commandname="shorten-sel"
+    shift
+    ;;
+  "-h"|"--help")
+    display_help
+    exit 0
+    ;;
+esac
+
+case "$commandname" in
+  "shorten-clip")
+    XCLIP_OPTS="-sel clip"
+    CLIP="yes"
+    ;;
+  "shorten-sel")
+    XCLIP_OPTS=""
+    CLIP="yes"
+    ;;
+  *)
+    CLIP="no"
+    ;;
+esac
+
+
+# If called with an argument, use that for the URL. If not, use the
+# clipboard contents with the url, unless we have been invoked as part of
+# a pipeline or had a file redirected to stdin
+if [ $# -gt 0 ]; then
+  URL="$1"
+else
+  URL=$(xclip -r -sel clip -o)
+  if [[ -t 0 ]]; then # Script is called with no other sources of input: Use the clipboard
+    URL=$(xclip -r -sel clip -o)
+  else # Script is maybe being run with stdin redirected from a file, or as part of a pipeline: Read from stdin
+    read -t 0 tempURL # The "-t 0" keeps the read from hanging
+    if [[ -n "$tempURL" ]]; then
+      URL="$tempURL"
+    fi
+  fi
+fi
+
+
+
+if [ "$1" == "test" ]; then
+  URL="https://maps.google.co.uk/maps?f=q&source=s_q&hl=en&geocode=&q=louth&sll=53.800651,-4.064941&sspn=33.219383,38.803711&ie=UTF8&hq=&hnear=Louth,+United+Kingdom&ll=53.370272,-0.004034&spn=0.064883,0.075788&z=14"
+fi
+
+
+url_regex='^(http|https):\/\/[-[:alnum:]\.]+(\.[[:alnum:]]{2,}+)([\/?].*)?$'
+
+notify-send --urgency=low "Shorten called with URL $URL"
+
+if [[ "$URL" =~ $url_regex ]]; then
+  shortened=$(cache_get "$URL")
+  if [[ "$shortened" == "" ]]; then
+    echo "URL not cached, retrieving from is.gd" >&2
+    # opt=2 means lower-case pronouncable
+    shortened=$(curl --silent "$ENDPOINT" --data-urlencode "url=$URL" --data-urlencode "opt=2" --data-urlencode "format=simple" 2>/dev/null)
+    cache_put "$URL" "$shortened"
+  fi
+  if [[ ! -t 0 ]]; then
+    notify-send --urgency=low "$shortened"
+  fi
+  # Only monkey with the clipboard if we got the URL from the clipboard
+  if [[ "$CLIP" == "yes" ]]; then
+    echo "$shortened" | eval xclip -r $XCLIP_OPTS
+  fi
+  echo "$shortened"
+else
+  echo "'$URL' doesn't seem to be a URL." >&2
+  if [[ ! -t 0 ]]; then
+    notify-send --urgency=low --icon dialog-warning "'$URL' doesn't seem to be a URL."
+  fi
+  display_help
+fi
+
